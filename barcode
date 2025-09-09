@@ -1,0 +1,175 @@
+# barcode_lookup_camera.py
+import cv2
+from pyzbar import pyzbar
+import requests
+import google.generativeai as genai
+import os
+
+# ========= CONFIG =========
+UPC_LOOKUP_URL = "https://api.upcitemdb.com/prod/trial/lookup"
+
+# Gemini API key
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# ==========================
+
+
+def list_available_cameras(max_test=5):
+    available = []
+    for i in range(max_test):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            available.append(i)
+            cap.release()
+    return available
+
+
+def select_camera():
+    cams = list_available_cameras()
+    if not cams:
+        raise RuntimeError("No cameras found.")
+    print("Available cameras:")
+    for idx in cams:
+        print(f"  Index {idx}")
+    while True:
+        try:
+            choice = int(input(f"Select camera index from {cams}: "))
+            if choice in cams:
+                return choice
+        except ValueError:
+            pass
+        print("Invalid choice. Try again.")
+
+
+def capture_image_from_camera(cam_index=0, preview_time=5):
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {cam_index}")
+
+    print(f"Using camera index {cam_index}")
+    print(f"Preview for {preview_time} seconds, then press SPACE to capture, Q to quit.")
+    start_ticks = cv2.getTickCount()
+    freq = cv2.getTickFrequency()
+
+    frame = None
+    while True:
+        ret, img = cap.read()
+        if not ret:
+            print("Failed to read from camera.")
+            break
+
+        elapsed = (cv2.getTickCount() - start_ticks) / freq
+        if elapsed < preview_time:
+            msg = f"Previewing... {int(preview_time - elapsed)}s left"
+        else:
+            msg = "Press SPACE to capture, Q to quit"
+        cv2.putText(img, msg, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 255, 0), 2)
+
+        cv2.imshow("Camera", img)
+        key = cv2.waitKey(1) & 0xFF
+
+        if elapsed >= preview_time:
+            if key == ord(' '):  # SPACE pressed
+                frame = img.copy()
+                print("Captured frame.")
+                break
+            elif key == ord('q'):
+                print("Quitting without capture.")
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return frame
+
+
+def decode_barcodes(image):
+    barcodes = pyzbar.decode(image)
+    return [{'code': b.data.decode('utf-8'), 'type': b.type} for b in barcodes]
+
+
+def lookup_upc(upc_code):
+    try:
+        r = requests.get(UPC_LOOKUP_URL, params={'upc': upc_code}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        print("HTTP error during lookup:", e)
+        return None
+
+
+def pretty_print_product(item):
+    title = item.get('title', '—')
+    brand = item.get('brand', '')
+    category = item.get('category', '')
+    desc = item.get('description', '')
+    images = item.get('images', [])
+    lines = [f"Title: {title}"]
+    if brand:
+        lines.append(f"Brand: {brand}")
+    if category:
+        lines.append(f"Category: {category}")
+    if desc:
+        lines.append(f"Description: {desc}")
+    if images:
+        lines.append(f"Image(s): {', '.join(images[:3])}")
+    return "\n".join(lines)
+
+
+def suggest_alternatives_with_gemini(product):
+    """Use Gemini API to suggest alternatives based on product info."""
+    title = product.get("title", "")
+    brand = product.get("brand", "")
+    category = product.get("category", "")
+    desc = product.get("description", "")
+
+    prompt = f"""
+    I have a product:
+    - Title: {title}
+    - Brand: {brand}
+    - Category: {category}
+    - Description: {desc}
+
+    Suggest 3 similar alternative products from the same category,
+    ideally from other brands, that a shopper might consider.
+    Answer as a bullet list.
+    """
+
+    try:
+        model = genai.GenerativeModel("gemini-pro")
+        resp = model.generate_content(prompt)
+        return resp.text
+    except Exception as e:
+        return f"Error from Gemini API: {e}"
+
+
+def main():
+    cam_index = select_camera()
+    frame = capture_image_from_camera(cam_index=cam_index, preview_time=5)
+    if frame is None:
+        print("No image captured. Exiting.")
+        return
+
+    codes = decode_barcodes(frame)
+    if not codes:
+        print("No barcode detected.")
+        return
+
+    upc = codes[0]['code']
+    print(f"Detected barcode: {upc}")
+
+    resp = lookup_upc(upc)
+    if not resp or resp.get('code') != 'OK' or resp.get('total', 0) == 0:
+        print("Product not found.")
+        return
+
+    item = resp['items'][0]
+    print("\n=== Product Found ===")
+    print(pretty_print_product(item))
+
+    print("\n=== Alternatives (via Gemini) ===")
+    alternatives = suggest_alternatives_with_gemini(item)
+    print(alternatives)
+
+
+if __name__ == "__main__":
+    main()
